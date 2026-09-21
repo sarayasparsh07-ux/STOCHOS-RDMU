@@ -1,7 +1,9 @@
-streamlit>=1.40
-plotly>=5.20
-numpy>=1.26
-pandas>=2.1
-scikit-learn>=1.4
-scipy>=1.11
+# Pinned to the versions the precomputed results (artifacts/results_default.pkl) were built with.
+# Unpinned installs still work, but may trigger a ~40 s recomputation on first load.
+streamlit==1.64.0
+plotly==7.1.0
+numpy==2.4.4
+pandas==3.0.2
+scikit-learn==1.8.0
+scipy==1.17.1
 pytest>=8

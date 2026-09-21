@@ -19,16 +19,25 @@ ARC_COLOR = {"front": "#C2364B", "left": "#0F8B8D", "right": "#9AA3B2", "back": 
 
 
 def _layout(fig, title=None, height=380, **kw):
-    margin = kw.pop("margin", dict(l=10, r=10, t=44 if title else 12, b=10))
+    """Shared look. The title sits on the first line and the legend on its own line
+    underneath, so they never overlap."""
+    named = [tr for tr in fig.data if getattr(tr, "name", None) and tr.showlegend is not False]
+    has_legend = len(named) > 1 and kw.get("showlegend", True) is not False
+    top = (44 if title else 12) + ((30 if len(named) <= 3 else 52) if has_legend else 0)
+    margin = kw.pop("margin", dict(l=10, r=10, t=top, b=10))
     fig.update_layout(
-        title=dict(text=title, x=0, xanchor="left", font=dict(size=15, color=INK)) if title else None,
+        title=dict(text=title, x=0, xanchor="left", y=1, yanchor="top", yref="container", pad=dict(t=10, l=4),
+                   font=dict(size=15, color=INK)) if title else None,
         height=height, margin=margin,
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor=PAPER,
         font=dict(family=FONT, size=12, color=INK),
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1, bgcolor="rgba(0,0,0,0)"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0, bgcolor="rgba(0,0,0,0)",
+                    font=dict(size=11), itemsizing="constant"),
         hoverlabel=dict(font_family=FONT), **kw)
-    fig.update_xaxes(gridcolor=GRID, zerolinecolor=GRID, linecolor=GRID)
-    fig.update_yaxes(gridcolor=GRID, zerolinecolor=GRID, linecolor=GRID)
+    fig.update_xaxes(gridcolor=GRID, zerolinecolor=GRID, linecolor=GRID, automargin=True, title_standoff=6,
+                     title_font=dict(size=12, color=MUTED))
+    fig.update_yaxes(gridcolor=GRID, zerolinecolor=GRID, linecolor=GRID, automargin=True, title_standoff=6,
+                     title_font=dict(size=12, color=MUTED))
     return fig
 
 
@@ -114,7 +123,7 @@ def arena_animation(ep: dict, radius: float, color: str, title: str, frame_ms: i
                                         args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")])])],
         sliders=[dict(active=0, x=0.2, len=0.8, y=-0.02, yanchor="top", pad=dict(t=6),
                       currentvalue=dict(visible=False), tickcolor=GRID, font=dict(size=9),
-                      steps=[dict(label=str(i), method="animate",
+                      steps=[dict(label=str(i) if i % 75 == 0 else "", method="animate",
                                   args=[[str(i)], dict(frame=dict(duration=0, redraw=False), mode="immediate")])
                              for i in idx])],
     )
@@ -172,16 +181,18 @@ def state_grid(values, pi, cfg, title, colorscale="Tealgrn", zmid=None, fmt="{:.
     return fig
 
 
-def zone_grid(zones, cfg, title="Reward zones", height=320):
+def zone_grid(zones, cfg, title="Reward zones", height=340):
+    short = ("Band", "Drift", "Lost", "Caution", "Danger", "Crash")
     z = np.asarray(zones[: cfg.n_grid]).reshape(cfg.n_front, cfg.n_left)
     cs = []
     n = len(ZONES)
     for i, c in enumerate(ZONE_COLOR):
         cs += [[i / n, c], [(i + 1) / n, c]]
     fig = go.Figure(go.Heatmap(z=z, x=left_labels(cfg), y=front_labels(cfg), zmin=-0.5 + 0.5, zmax=n,
-                               colorscale=cs, showscale=False, text=[[ZONES[v] for v in r] for r in z],
-                               texttemplate="%{text}", textfont=dict(size=10, color="white"),
-                               hovertemplate="front %{y}<br>left %{x}<br>%{text}<extra></extra>"))
+                               colorscale=cs, showscale=False, text=[[short[v] for v in r] for r in z],
+                               customdata=[[ZONES[v] for v in r] for r in z],
+                               texttemplate="%{text}", textfont=dict(size=11, color="white"),
+                               hovertemplate="front %{y}<br>left %{x}<br>%{customdata}<extra></extra>"))
     fig.data[0].update(z=z + 0.5)
     _layout(fig, title, height)
     fig.update_xaxes(title="SD_left bin (m)")
@@ -403,12 +414,13 @@ def validation_bars(v, height=300):
         fig.add_trace(go.Bar(x=list(ACTION_SHORT), y=v[f"freq_{key}"], name=name, marker_color=c), 1, 1)
         fig.add_trace(go.Bar(x=["front", "left", "right", "back"], y=v[f"median_{key}"], name=name,
                              marker_color=c, showlegend=False), 1, 2)
-    _layout(fig, None, height, barmode="group")
+    _layout(fig, None, height, barmode="group", margin=dict(l=10, r=10, t=36, b=60))
+    fig.update_layout(legend=dict(y=-0.18, yanchor="top", x=0.5, xanchor="center"))
     return fig
 
 
 # ------------------------------------------------------------ added visuals
-def reward_heatmaps(R, cfg, height=300):
+def reward_heatmaps(R, cfg, height=360):
     """Expected immediate reward R(s, a) for each action."""
     fig = make_subplots(rows=1, cols=4, subplot_titles=[f"{ACTION_GLYPH[i]} {ACTION_SHORT[i]}" for i in range(4)],
                         horizontal_spacing=0.03, shared_yaxes=True)
@@ -420,7 +432,7 @@ def reward_heatmaps(R, cfg, height=300):
                                  textfont=dict(size=9), colorbar=dict(title="R", thickness=10),
                                  hovertemplate="front %{y}<br>left %{x}<br>R = %{z:.3f}<extra></extra>"), 1, a + 1)
         fig.update_xaxes(tickfont=dict(size=8), tickangle=45, row=1, col=a + 1)
-    _layout(fig, "Expected immediate reward R(s, a) = Σ P(s′|s,a) r(s′,a)", height)
+    _layout(fig, "Expected immediate reward R(s, a) = Σ P(s′|s,a) r(s′,a)", height, margin=dict(l=10, r=10, t=80, b=10))
     fig.update_yaxes(title="SD_front bin", col=1)
     return fig
 
