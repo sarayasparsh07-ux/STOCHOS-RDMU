@@ -359,7 +359,7 @@ def page_robot():
     left, right = st.columns([1.7, 1], gap="medium")
     with left:
         with st.container(border=True):
-            chart(arena.mission_animation(ep, room, cfg.twin.robot_radius, color, SPEED_MS[speed] * stride, stride, 600, kind="random" if method == "random" else "car"))
+            chart(arena.mission_animation(ep, room, cfg.twin.robot_radius, color, SPEED_MS[speed] * stride, stride, 600))
             legend = " ".join(f"<span class='pill' style='background:{ZONE_COLOR[i]}'>{ZONES[i]}</span>" for i in (0, 3, 4))
             note(f"▶ Play / ⏸ Pause animate the run; drag the slider to scrub. Red rays: front arc · teal rays: left arc. "
                  f"Path dots by zone: {legend}")
