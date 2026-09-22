@@ -1,10 +1,18 @@
 """Room and robot drawings for the Live robot view (Plotly).
 
+The agents are drawn as realistic cars seen from a slightly raised
+three-quarter angle: a rounded coloured body with two shaded side skirts for
+depth, a hood, a cabin (windshield + roof), paired head- and tail-lights, four
+rounded wheels and a soft ground shadow that plants each car on the floor.  All
+cars share one design language and differ only in colour.  ``kind="random"``
+swaps the solid roof for a translucent glass dome and a cloud of sample points,
+marking the probabilistic agent.  These are purely visual representations of the
+twin's robot and do not change the model.
+
 * ``room_traces``      floor, walls, free-standing pillars, entry door, exit gate
-* ``robot_traces``     top-down SCITOS-style robot: body, drive wheels, 24-sonar ring,
-                       sensor dome and a heading chevron, in the method's colour
-* ``mission_animation`` one robot with its sonar arcs, trail and reward zones
-* ``race_animation``   every method's robot in the same hall, each in its own colour
+* ``robot_traces``     one car (12 traces, fixed order) in the method's colour
+* ``mission_animation`` one car with its sonar arcs, trail and reward zones
+* ``race_animation``   every method's car in the same hall, each in its own colour
 * ``room_map``         static, annotated floor plan
 """
 from __future__ import annotations
@@ -112,53 +120,157 @@ def room_traces(room: Room, labels: bool = True):
 
 
 # ------------------------------------------------------------------------ robot
-def _robot_geometry(pose, r):
-    """Polygons of a top-down robot at pose (x, y, heading), in world coordinates."""
+# The robots are drawn as futuristic autonomous robot cars, seen from a slightly
+# raised three-quarter angle.  A pose is (x, y, heading) in world metres, heading
+# in radians (0 = +x).  The car points along +heading (its "forward" axis u); the
+# left axis v is +90 deg from it.  Depth is faked with a fixed screen-space "lift"
+# so raised parts (body top, canopy) sit above their footprint and every car
+# throws a ground shadow, which gives clear floor contact.  Numbers below are in
+# units of the robot radius r, tuned once so a car fills the same footprint the
+# old disc robot did (roughly 2r long, 1.5r wide).
+
+LIFT = np.array([0.0, 0.34])          # screen-space rise (world y) per unit height
+_CAR_L, _CAR_W = 1.9, 1.35            # body length / width in units of r
+
+
+def _car_parts(pose, r):
+    """Polygons of a realistic car at pose (x, y, heading), in world coordinates.
+
+    Drawn from a slightly raised three-quarter view: a rounded body with a
+    separate cabin (windshield + roof), a hood, paired head- and tail-lights,
+    four rounded wheels and a soft ground shadow.  ``height`` (screen-space lift)
+    lifts the roof and cabin above the body so the car reads three-dimensional.
+    """
     x, y, h = pose
-    c, s = np.cos(h), np.sin(h)
-    rot = np.array([[c, s], [-s, c]])
+    u = np.array([np.cos(h), np.sin(h)])      # forward (car nose)
+    v = np.array([-np.sin(h), np.cos(h)])     # left
 
-    def w(p):
-        return np.asarray(p) @ rot + (x, y)
+    def w(fwd, lat, lift=0.0):
+        p = np.asarray(fwd, float)[..., None] * u + np.asarray(lat, float)[..., None] * v + (x, y)
+        return p + lift * LIFT * r
 
-    t = np.linspace(0, 2 * np.pi, 30, endpoint=False)
-    circle = np.column_stack([np.cos(t), np.sin(t)])
-    body = w(r * circle)
-    wheels = []
-    for side in (1, -1):
-        cx, cy, L, W = 0.0, side * 0.95 * r, 0.62 * r, 0.32 * r
-        wheels.append(w([(cx - L / 2, cy - W / 2), (cx + L / 2, cy - W / 2), (cx + L / 2, cy + W / 2),
-                         (cx - L / 2, cy + W / 2)]))
-    caster = w(0.12 * r * circle + (-0.72 * r, 0))
-    dome = w(0.42 * r * circle + (-0.12 * r, 0))
-    chevron = w([(0.84 * r, 0), (0.30 * r, 0.42 * r), (0.44 * r, 0), (0.30 * r, -0.42 * r)])
-    ang = np.arange(N_SONAR) * 2 * np.pi / N_SONAR
-    sonar = w(0.86 * r * np.column_stack([np.cos(ang), np.sin(ang)]))
-    return body, wheels + [caster], dome, chevron, sonar
+    def rounded(f0, f1, half_w, round_front, round_rear, n=7, lift=0.0):
+        """A capsule-ish body outline from rear (f0) to front (f1)."""
+        fwd, lat = [], []
+        aa = np.linspace(-np.pi / 2, np.pi / 2, n)         # front cap
+        for a in aa:
+            fwd.append(f1 - round_front + round_front * np.cos(a)); lat.append(half_w * np.sin(a))
+        ab = np.linspace(np.pi / 2, 3 * np.pi / 2, n)      # rear cap
+        for a in ab:
+            fwd.append(f0 + round_rear + round_rear * np.cos(a)); lat.append(half_w * np.sin(a))
+        return w(fwd, lat, lift)
+
+    L, W = _CAR_L * r, _CAR_W * r
+    hf, hw = L / 2, W / 2
+
+    # body: rounded rectangle, longer round at the nose than the tail
+    footprint = rounded(-hf, hf, hw, 0.55 * hf, 0.32 * hf)
+    body_top = rounded(-hf, hf, hw * 0.94, 0.55 * hf, 0.32 * hf, lift=0.55)
+
+    # side skirt between footprint and body top on each side (depth)
+    def skirt(sign):
+        lo = footprint[footprint[:, 0] * 0 == 0]           # all points
+        # take the outer edge on this side by lateral sign in body frame
+        fwd = (footprint - (x, y)) @ u
+        lat = (footprint - (x, y)) @ v
+        m = np.where(lat * sign > 0.02 * r)[0]
+        base = w(fwd[m], lat[m])
+        top = w(fwd[m], lat[m], lift=0.55)
+        return np.vstack([base, top[::-1]])
+    left_side = skirt(+1)
+    right_side = skirt(-1)
+
+    # hood then cabin (windshield + roof) sitting on the body top
+    hood = rounded(-hf * 0.05, hf * 0.62, hw * 0.7, 0.42 * hf, 0.05 * hf, n=5, lift=0.6)
+    cabin = rounded(-hf * 0.62, hf * 0.12, hw * 0.66, 0.18 * hf, 0.30 * hf, n=6, lift=0.95)
+    roof = rounded(-hf * 0.5, -hf * 0.02, hw * 0.5, 0.12 * hf, 0.22 * hf, n=6, lift=1.05)
+
+    # paired lights: two headlamps at the nose, two tail-lamps at the rear
+    def dot(cf, cl, rad, lift):
+        t = np.linspace(0, 2 * np.pi, 12, endpoint=False)
+        return w(cf + rad * np.cos(t), cl + rad * np.sin(t), lift)
+    head_l = dot(hf * 0.86, hw * 0.52, 0.12 * r, 0.58)
+    head_r = dot(hf * 0.86, -hw * 0.52, 0.12 * r, 0.58)
+    tail_l = dot(-hf * 0.9, hw * 0.55, 0.10 * r, 0.58)
+    tail_r = dot(-hf * 0.9, -hw * 0.55, 0.10 * r, 0.58)
+
+    # four rounded wheels straddling the sides
+    def wheel(cf, cl):
+        t = np.linspace(0, 2 * np.pi, 14, endpoint=False)
+        return w(cf + 0.30 * r * np.cos(t), cl + 0.17 * r * np.sin(t), 0.12)
+    wheels = [wheel(f, s * hw * 0.99) for f in (hf * 0.55, -hf * 0.58) for s in (1, -1)]
+
+    return dict(footprint=footprint, wheels=wheels, left=left_side, right=right_side, body=body_top,
+                hood=hood, cabin=cabin, roof=roof, head_l=head_l, head_r=head_r,
+                tail_l=tail_l, tail_r=tail_r)
 
 
-def robot_traces(pose, r, color, visible=True, label=None, badge=None):
-    """Six traces: wheels, body, dome, chevron, sonar ring, text label."""
+def _shade(hex_color, factor):
+    """Lighten (factor>1) or darken (factor<1) a #rrggbb colour."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    f = lambda c: max(0, min(255, int(c * factor)))
+    return f"#{f(r):02x}{f(g):02x}{f(b):02x}"
+
+
+N_ROBOT_TRACES = 12   # fixed trace count per robot, so animation frames stay aligned
+
+
+def robot_traces(pose, r, color, visible=True, label=None, badge=None, kind="car"):
+    """A realistic car as a fixed list of 12 Plotly traces (fixed order, so
+    animation frames can address them positionally; empty traces when hidden).
+
+    Order: shadow, wheels, side_l, side_r, body, hood, cabin/glass, roof-or-cloud,
+    headlights, taillights, footprint-outline, text label.  ``kind="random"``
+    swaps the solid roof for a translucent glass dome and a cloud of sample
+    points, marking the probabilistic agent.
+    """
     if not visible or pose is None:
-        e = dict(x=[], y=[])
-        return [go.Scatter(**e, mode="lines"), go.Scatter(**e, mode="lines"), go.Scatter(**e, mode="lines"),
-                go.Scatter(**e, mode="lines"), go.Scatter(**e, mode="markers"), go.Scatter(**e, mode="text")]
-    body, wheels, dome, chev, sonar = _robot_geometry(pose, r)
-    wx, wy = _join(wheels)
-    b, d, ch = _closed(body), _closed(dome), _closed(chev)
+        return [go.Scatter(x=[], y=[], mode="lines") for _ in range(N_ROBOT_TRACES - 2)] + \
+               [go.Scatter(x=[], y=[], mode="markers"), go.Scatter(x=[], y=[], mode="text")]
+
+    p = _car_parts(pose, r)
+    dark, light = _shade(color, 0.60), _shade(color, 1.30)
+    glass = "rgba(191,219,254,0.92)"
+    wx, wy = _join([_closed(w) for w in p["wheels"]])
+    ft, bt = _closed(p["footprint"]), _closed(p["body"])
+    ls, rs = _closed(p["left"]), _closed(p["right"])
+    hood, cabin, roof = _closed(p["hood"]), _closed(p["cabin"]), _closed(p["roof"])
+    hl, hr = _closed(p["head_l"]), _closed(p["head_r"])
+    tl, tr = _closed(p["tail_l"]), _closed(p["tail_r"])
     txt = " ".join(x for x in (label, badge) if x)
-    return [
-        go.Scatter(x=wx, y=wy, mode="lines", fill="toself", fillcolor=INK, line=dict(color=INK, width=1)),
-        go.Scatter(x=b[:, 0], y=b[:, 1], mode="lines", fill="toself", fillcolor=color, line=dict(color=INK, width=2)),
-        go.Scatter(x=d[:, 0], y=d[:, 1], mode="lines", fill="toself", fillcolor="rgba(255,255,255,0.28)",
-                   line=dict(color="rgba(255,255,255,0.55)", width=1)),
-        go.Scatter(x=ch[:, 0], y=ch[:, 1], mode="lines", fill="toself", fillcolor="#FFFFFF",
-                   line=dict(color="#FFFFFF", width=1)),
-        go.Scatter(x=sonar[:, 0], y=sonar[:, 1], mode="markers",
-                   marker=dict(size=3, color="rgba(255,255,255,0.9)", line=dict(width=0))),
-        go.Scatter(x=[pose[0]], y=[pose[1] + r + 0.2], mode="text", text=[txt],
-                   textfont=dict(size=11, color=color, family=FONT)),
-    ]
+    lx, ly = pose[0], pose[1] + _CAR_W * r * 0.62 + LIFT[1] * r * 1.9
+
+    shadow = go.Scatter(x=ft[:, 0] + 0.10 * r, y=ft[:, 1] - 0.12 * r, mode="lines", fill="toself",
+                        fillcolor="rgba(15,23,42,0.22)", line=dict(color="rgba(0,0,0,0)"))
+    wheels = go.Scatter(x=wx, y=wy, mode="lines", fill="toself", fillcolor="#111827", line=dict(color="#0B0F19", width=1))
+    side_l = go.Scatter(x=ls[:, 0], y=ls[:, 1], mode="lines", fill="toself", fillcolor=dark, line=dict(color=INK, width=1))
+    side_r = go.Scatter(x=rs[:, 0], y=rs[:, 1], mode="lines", fill="toself", fillcolor=dark, line=dict(color=INK, width=1))
+    body = go.Scatter(x=bt[:, 0], y=bt[:, 1], mode="lines", fill="toself", fillcolor=color, line=dict(color=INK, width=1.6))
+    hood_t = go.Scatter(x=hood[:, 0], y=hood[:, 1], mode="lines", fill="toself", fillcolor=light, line=dict(color=color, width=1))
+    heads = go.Scatter(x=hl[:, 0].tolist() + [None] + hr[:, 0].tolist(),
+                       y=hl[:, 1].tolist() + [None] + hr[:, 1].tolist(), mode="lines", fill="toself",
+                       fillcolor="#FEF3C7", line=dict(color="#F59E0B", width=1))
+    tails = go.Scatter(x=tl[:, 0].tolist() + [None] + tr[:, 0].tolist(),
+                       y=tl[:, 1].tolist() + [None] + tr[:, 1].tolist(), mode="lines", fill="toself",
+                       fillcolor="#F87171", line=dict(color="#DC2626", width=1))
+    outline = go.Scatter(x=ft[:, 0], y=ft[:, 1], mode="lines", line=dict(color=INK, width=1))
+    label_t = go.Scatter(x=[lx], y=[ly], mode="text", text=[txt], textfont=dict(size=11, color=color, family=FONT))
+
+    if kind == "random":
+        rng = np.random.default_rng(int((pose[0] * 131 + pose[1] * 57) * 1000) % (2**32))
+        centre = p["roof"].mean(0)
+        cloud = centre + rng.normal(0, 0.15 * r, size=(24, 2))
+        cabin_t = go.Scatter(x=cabin[:, 0], y=cabin[:, 1], mode="lines", fill="toself",
+                             fillcolor="rgba(226,240,253,0.35)", line=dict(color="#FFFFFF", width=1.2, dash="dot"))
+        roof_t = go.Scatter(x=cloud[:, 0], y=cloud[:, 1], mode="markers",
+                           marker=dict(size=4, color=light, opacity=0.85, symbol="diamond", line=dict(width=0)))
+    else:
+        cabin_t = go.Scatter(x=cabin[:, 0], y=cabin[:, 1], mode="lines", fill="toself", fillcolor=glass,
+                            line=dict(color="#1E3A5F", width=1))
+        roof_t = go.Scatter(x=roof[:, 0], y=roof[:, 1], mode="lines", fill="toself", fillcolor=color,
+                          line=dict(color=INK, width=1))
+    return [shadow, wheels, side_l, side_r, body, hood_t, cabin_t, roof_t, heads, tails, outline, label_t]
 
 
 # --------------------------------------------------------------------- layout
@@ -197,7 +309,7 @@ def _hud(text):
 
 # ------------------------------------------------------------ single robot run
 def mission_animation(ep: dict, room: Room, radius: float, color: str, frame_ms: int = 90,
-                      stride: int = 1, height: int = 560):
+                      stride: int = 1, height: int = 560, kind: str = "car"):
     arcs = arc_beams(60.0)
     poses = ep["pose"]
     n = len(poses)
@@ -229,7 +341,7 @@ def mission_animation(ep: dict, room: Room, radius: float, color: str, frame_ms:
                 go.Scatter(x=rr["front"][0], y=rr["front"][1], mode="lines", line=dict(color=RAY["front"], width=1.6)),
                 go.Scatter(x=path[:i + 2, 0], y=path[:i + 2, 1], mode="lines",
                            line=dict(color=color, width=3.5), opacity=0.85)]
-        data += robot_traces(pose, radius, color, badge=badge)
+        data += robot_traces(pose, radius, color, badge=badge, kind=kind)
         sd = ep["sd"][i]
         z = int(ep["zone"][i])
         txt = (f"<b>t = {i / 3:5.1f} s</b> · step {i} · {ACTION_GLYPH[ep['action'][i]]} {ACTIONS[ep['action'][i]]}"
@@ -286,7 +398,7 @@ def race_animation(eps: dict, room: Room, radius: float, colors: dict, stagger: 
         for k in keys:
             pose, out, m, done = state(k, g)
             data += robot_traces(pose, radius, colors[k], visible=pose is not None, label=SHORT[k],
-                                 badge=BADGE.get(out) if done else None)
+                                 badge=BADGE.get(out) if done else None, kind="random" if k == "random" else "car")
             if pose is None:
                 status.append(f"<span style='color:{colors[k]}'>●</span> {SHORT[k]} waiting")
             elif done:
@@ -327,14 +439,14 @@ def robot_closeup(colors: dict, labels: dict, radius=0.29, height=220):
     """One robot per method, side by side, for the legend."""
     tr, ann = [], []
     for j, (k, c) in enumerate(colors.items()):
-        tr += robot_traces((j * 1.0, 0.0, np.pi / 2), radius, c)[:5]
-        ann.append(dict(x=j * 1.0, y=-0.52, text=labels[k], showarrow=False, font=dict(size=11, color=c)))
+        tr += robot_traces((j * 1.6, 0.0, np.pi / 2), radius, c, kind="random" if k == "random" else "car")[:-1]
+        ann.append(dict(x=j * 1.6, y=-0.95, text=labels[k], showarrow=False, font=dict(size=11, color=c)))
     fig = go.Figure(data=tr, layout=dict(annotations=ann))
     n = len(colors)
     fig.update_layout(height=height, margin=dict(l=4, r=4, t=4, b=4), paper_bgcolor="rgba(0,0,0,0)",
                       plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
-    fig.update_xaxes(range=[-0.6, n - 0.4], visible=False, fixedrange=True)
-    fig.update_yaxes(range=[-0.75, 0.5], visible=False, scaleanchor="x", fixedrange=True)
+    fig.update_xaxes(range=[-1.1, (n - 1) * 1.6 + 1.1], visible=False, fixedrange=True)
+    fig.update_yaxes(range=[-1.25, 0.95], visible=False, scaleanchor="x", fixedrange=True)
     for t in fig.data:
         t.update(hoverinfo="skip")
     return fig
