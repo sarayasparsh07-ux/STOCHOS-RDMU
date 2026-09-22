@@ -161,11 +161,11 @@ METHOD_LABEL = {
     "hj": "Hooke–Jeeves Policy Search",
     "random": "Random baseline",
 }
-METHOD_COLOR = {
-    "expert": "#6B7280",
-    "mdp": "#3552C7",
-    "adp": "#0F8B8D",
-    "mcps": "#D08C0B",
-    "hj": "#C2364B",
-    "random": "#A8B0BD",
+METHOD_COLOR = {                 # one clearly different colour per method (robot body, trail, charts)
+    "expert": "#7C3AED",         # violet
+    "mdp": "#2563EB",            # blue
+    "adp": "#059669",            # emerald
+    "mcps": "#D97706",           # amber
+    "hj": "#DB2777",             # magenta
+    "random": "#64748B",         # slate
 }

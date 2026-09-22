@@ -9,7 +9,7 @@ The recorded run is turned into one decision problem, which is solved with four 
 - Monte Carlo policy search
 - Hooke–Jeeves pattern search
 
-All four drive the same simulated robot, together with the robot's original controller and a random baseline. They are compared under identical conditions. The Streamlit app shows the robot moving and explains each decision it makes.
+All four drive the same simulated robot, together with the robot's original controller and a random baseline. They are compared under identical conditions. The Streamlit app shows the robot moving and explains each decision it makes, either one method at a time or as a race with every method's robot in its own colour.
 
 ## Dataset
 **Source.** Kaggle / UCI, *Wall-Following navigation task with mobile robot SCITOS-G5* (Freire et al., 2009). Files are in `data/`.
@@ -117,11 +117,14 @@ python -m pytest -q
 ## Project structure
 | Path | Purpose |
 |---|---|
-| `app.py` | Streamlit app. Tabs: Robot, Dataset, MDP, ADP, Policy search, Comparison, Notebook audit, Method notes |
+| `app.py` | Streamlit app. Pages: Live robot (single or race, either room), Compare methods (incl. Mission hall), Data, MDP, ADP, Policy search, Notebook audit, About |
 | `rdmu/config.py` | All parameters, each labelled with its provenance: data, slide, assumption, calibrated or physical |
 | `rdmu/data.py` | Loading, quality audit, statistics, rule extraction, time-series evidence, empirical transitions |
 | `rdmu/statespace.py` | State discretisation, reward zones, reward function |
-| `rdmu/twin.py` | Vectorised robot simulator: kinematics, 24-beam sonar, collisions, start poses |
+| `rdmu/twin.py` | Vectorised robot simulator: kinematics, 24-beam sonar, collisions, start poses, any room |
+| `rdmu/rooms.py` | Room layouts: calibration room and mission hall (pillars, entry, exit) |
+| `rdmu/mission.py` | Entry-to-exit runs and the loop watchdog |
+| `rdmu/arena.py` | Room, robot icon, single-robot and race animations, mission charts |
 | `rdmu/model.py` | Estimation of P and R; validation of the simulator against the recording |
 | `rdmu/mdp.py` | Value iteration, policy iteration, exact policy evaluation, CSV export |
 | `rdmu/adp.py` | Radial basis features and fitted Q-iteration |
@@ -132,11 +135,33 @@ python -m pytest -q
 | `rdmu/plots.py` | Every chart (Plotly, one colour system) |
 | `rdmu/pipeline.py` | Runs all methods and caches the results |
 | `scripts/` | Rebuilding the precomputed results and calibrating the simulator |
-| `tests/` | 19 tests: data, states, rewards, simulator, all four methods, policy-driven robot, app switching, step/reset, invalid input |
+| `tests/` | 26 tests: rooms, pillars, missions, loop watchdog, colours, data, states, rewards, simulator, all four methods, policy-driven robot, app switching, step/reset, invalid input |
 | `outputs/optimal_value_function.csv` | Slide-required output |
 
+## Rooms, missions and the loop watchdog
+**Two rooms** (`rdmu/rooms.py`):
+- **Calibration room**, 6.4 × 4.2 m with a wall pillar and a recess. The simulator is calibrated and every method is trained here.
+- **Mission hall**, 8.4 × 5.6 m and the app's default room. It has a 45° chamfered corner, a curved corner, a pitched top wall, a column in the left wall and three free-standing pillars (round, diamond, rectangular). An entry corridor runs in line with the bottom wall and an exit corridor in line with the top wall.
+
+**Design rules for the hall.** A wall-follower loses the wall at a door that opens at right angles and starts circling, so both corridors continue straight along a wall. The ±30° front sonar makes a nearby pillar look like a wall ahead, and the robot then orbits it. Every pillar is therefore at least 0.8 m sideways from the wall-following lane. Outside corners along the route are kept gentle (about 12°).
+
+**Missions** (`rdmu/mission.py`). A run starts at the entry door with a small seeded offset and ends in one of four ways:
+- **exit:** the robot passes the exit gate
+- **crash:** it touches a wall or pillar
+- **loop:** the watchdog fires because the robot comes back within 0.30 m of a spot it passed 20 s or more earlier (a second lap, circling a pillar, spinning on the spot)
+- **timeout:** the time limit is reached
+
+The watchdog runs in both rooms, so no robot laps or circles in the app.
+
+**Transfer result** (200 runs per method from the entry, trained in the calibration room): recorded controller, MDP, Monte Carlo search and Hooke–Jeeves reach the exit in 100% of runs. ADP reaches it in 96%, and the watchdog stops the remaining 4% while they circle near the exit. The random baseline always collides. Median time to exit is 130–145 s. The *Compare methods → Mission hall* tab reproduces this with 100 runs per method.
+
+**Display** (`rdmu/arena.py`):
+- **Robot:** a top-down robot with drive wheels, a 24-sonar ring, a sensor dome and a heading arrow.
+- **Colours:** one colour per method, used everywhere. Recorded = violet, MDP = blue, ADP = emerald, Monte Carlo = amber, Hooke–Jeeves = magenta, random = slate, custom = cyan.
+- **Views:** a *Single robot* view with sonar rays and the decision inspector, and a *Race* view where all six robots enter one after another.
+
 ## Methodological assumptions
-- **Room:** 6.4 × 4.2 m with a pillar and a recess. The real floor plan is not published.
+- **Rooms:** training uses 6.4 × 4.2 m with a pillar and a recess (the real floor plan is not published). The mission hall is a transfer test, not a training environment.
 - **Decisions:** one every 1/3 s. The 9 Hz sampling rate comes from the data.
 - **Motion:** forward speed of 0.155 m/s is measured from the data. Turn rates are calibrated to the recorded sensor medians (`scripts/calibrate_twin.py`). Motion and sensor noise are assumed.
 - **Reward values:** assumed. The zone thresholds come from the data.

@@ -9,15 +9,17 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from rdmu import data, legacy_audit, plots
+from rdmu import arena, data, legacy_audit, plots
 from rdmu.config import (ACTION_GLYPH, ACTION_SHORT, ACTIONS, DATA_DIR, DEFAULT, EXPERT_THRESHOLDS, METHOD_COLOR,
                          METHOD_KEYS, METHOD_LABEL)
-from rdmu.evaluation import record_episode, run_batch, summarise
+from rdmu.evaluation import run_batch, summarise
+from rdmu.mission import OUTCOME_LABEL, mission_batch, record_mission, summarise_missions
 from rdmu.pipeline import build_policies, load_or_run
 from rdmu.policies import ThresholdPolicy
 from rdmu.policy_search import BOUNDS, feasible
 from rdmu.statespace import (ZONES, ZONE_COLOR, representative_readings, state_label, state_zone_table,
                              threshold_actions)
+from rdmu.rooms import MISSION, ROOMS
 from rdmu.twin import WallFollowTwin
 
 st.set_page_config(page_title="STOCHOS · RDMU robot", page_icon="🛰️", layout="wide",
@@ -96,7 +98,7 @@ section[data-testid="stSidebar"] h3 { font-size: 0.8rem; text-transform: upperca
 """, unsafe_allow_html=True)
 
 LABELS = {**METHOD_LABEL, "custom": "Custom thresholds (manual)"}
-COLORS = {**METHOD_COLOR, "custom": "#7A4FB5"}
+COLORS = {**METHOD_COLOR, "custom": "#0891B2"}
 REQUIRED_FILES = ("sensor_readings_2.csv", "sensor_readings_4.csv", "sensor_readings_24.csv", "Day_5.ipynb")
 PAGES = ["Live robot", "Compare methods", "Data", "MDP", "ADP", "Policy search", "Notebook audit", "About"]
 
@@ -115,14 +117,9 @@ METHOD_EXPLAIN = {
     "custom": "The recorded controller's rule with thresholds you set in the sidebar, for exploring the objective by hand.",
 }
 
-START_POSES = {
-    "Bottom wall, beside the pillar": (5.0, 1.05, np.pi),
-    "Left wall, heading north": (0.85, 1.4, np.pi / 2),
-    "Top wall, before the recess": (1.6, 3.55, 0.0),
-    "Right wall, heading south": (5.6, 3.0, -np.pi / 2),
-    "Room centre, no wall in range": (2.6, 2.1, 0.6),
-    "Random start (uses the seed)": None,
-}
+RANDOM_START = "Random start (uses the seed)"
+SPEED_MS = {"0.5×": 660, "1×": 330, "2×": 165, "4×": 80, "8×": 40}   # per decision
+MISSION_HORIZON = 750
 
 
 # =========================================================================== UI helpers
@@ -179,8 +176,16 @@ def make_policy(res, cfg, method, custom_thr=None):
 
 
 @st.cache_data(show_spinner=False)
-def get_episode(_res, cfg, method, start, seed, horizon, custom_thr=None):
-    return record_episode(make_policy(_res, cfg, method, custom_thr), cfg, np.array(start), horizon, seed, _res["model"])
+def get_episode(_res, cfg, method, room_key, start, seed, horizon, custom_thr=None):
+    """start None = the room's entry door (mission).  Every run has the loop watchdog."""
+    return record_mission(make_policy(_res, cfg, method, custom_thr), cfg, ROOMS[room_key], horizon, seed,
+                          _res["model"], None if start is None else np.array(start))
+
+
+@st.cache_data(show_spinner=False)
+def mission_stats(_res, cfg, method, n, seed, custom_thr=None):
+    m = mission_batch(make_policy(_res, cfg, method, custom_thr), cfg, MISSION, n, MISSION_HORIZON, seed)
+    return summarise_missions(m), m["step"][m["outcome"] == "exit"] / 3
 
 
 @st.cache_data(show_spinner=False)
@@ -189,11 +194,13 @@ def batch_run(_res, cfg, method, n, horizon, seed, custom_thr=None):
     return summarise(m), m["return"], m["crashed"]
 
 
-def start_pose(name, seed, cfg):
-    p = START_POSES[name]
-    if p is None:
-        return tuple(WallFollowTwin(cfg.twin).mixed_starts(1, np.random.default_rng(seed), 0.6)[0])
-    return p
+def start_pose(name, seed, cfg, room):
+    """None means: start at the entry door (with seeded jitter)."""
+    if room.has_mission:
+        return None
+    if name not in room.starts:
+        return tuple(WallFollowTwin(cfg.twin, room).mixed_starts(1, np.random.default_rng(seed), 0.6)[0])
+    return tuple(room.starts[name])
 
 
 # =========================================================================== sidebar
@@ -215,11 +222,15 @@ with st.sidebar:
             custom_thr = EXPERT_THRESHOLDS
 
     st.markdown("### Robot run")
-    start_name = st.selectbox("Start position", list(START_POSES))
+    room_key = st.selectbox("Room", list(ROOMS), format_func=lambda k: ROOMS[k].name)
+    room = ROOMS[room_key]
+    view = st.segmented_control("View", ["Single robot", "Race: all methods"], default="Single robot",
+                                key="view") or "Single robot"
+    start_name = st.selectbox("Start position", list(room.starts) + ([] if room.has_mission else [RANDOM_START]))
     c1, c2 = st.columns(2)
     seed = int(c1.number_input("Noise seed", 0, 10_000, 3, step=1))
     speed = c2.selectbox("Playback", ["0.5×", "1×", "2×", "4×", "8×"], index=2)
-    horizon = st.slider("Episode length (decisions, 3 per second)", 60, 900, 450, step=30)
+    horizon = st.slider("Time limit (decisions, 3 per second)", 60, 900, MISSION_HORIZON, step=30)
     n_batch = st.slider("Number of episodes (batch run)", 10, 200, 50, 10)
 
     with st.expander("Model settings"):
@@ -243,8 +254,11 @@ with st.sidebar:
     with st.expander("Goal and environment"):
         st.caption("**Goal:** a region, not a single cell. Keep the wall on the left at 0.494–0.901 m with more than "
                    "0.900 m clear ahead (the tracking band), never collide, keep moving.")
-        st.caption("**Environment:** 6.4 × 4.2 m room with a pillar and a recess; 24 sonar beams in 60° arcs; "
-                   "one decision every 1/3 s; sensor and motion noise.")
+        st.caption("**Rooms:** the mission hall (8.4 × 5.6 m: chamfered, curved and pitched walls, a wall column, "
+                   "three pillars, entry and exit corridors) and the 6.4 × 4.2 m calibration room the methods were "
+                   "trained in. 24 sonar beams in 60° arcs; one decision every 1/3 s; sensor and motion noise.")
+        st.caption("**Runs end** at the exit, on a collision, at the time limit, or when the loop watchdog sees the "
+                   "robot return to a spot it passed 20 s or more earlier.")
 
 cfg = st.session_state.get("cfg", DEFAULT)
 
@@ -309,26 +323,46 @@ def method_kpis():
 
 
 # =========================================================================== pages
+def race_view():
+    section("Race: every method in the same room",
+            ("All six controllers enter through the same door one after another, each in its own colour. They are "
+             "simulated independently (they do not see each other) with the same seed, so any difference comes "
+             "from the decisions.") if room.has_mission else
+            "All six controllers start from the same pose, one after another, each in its own colour.")
+    start = start_pose(start_name, seed, cfg, room)
+    eps = {k: get_episode(res, cfg, k, room_key, start, seed, horizon) for k in METHOD_KEYS}
+    with st.container(border=True):
+        chart(arena.race_animation(eps, room, cfg.twin.robot_radius, COLORS, stagger=15, stride=3,
+                                   frame_ms=SPEED_MS[speed] * 3, height=640), key="race")
+        note("▶ Play / ⏸ Pause animate the race; drag the slider to scrub. Badges: ✓ reached the exit · "
+             "⟲ loop detected and stopped · ✕ collision · ⏱ out of time.")
+    kpis([(LABELS[k], OUTCOME_LABEL[eps[k]["outcome"]],
+           f"{len(eps[k]['action']) / 3:.0f} s · Σ reward {eps[k]['reward'].sum():+.1f}", COLORS[k]) for k in METHOD_KEYS])
+    chart(arena.robot_closeup({k: COLORS[k] for k in METHOD_KEYS}, {k: arena.SHORT[k] for k in METHOD_KEYS}, height=150))
+
+
 def page_robot():
+    if view.startswith("Race"):
+        return race_view()
     section(f"<span class='pill' style='background:{color}'>{LABELS[method]}</span> driving the robot",
             "Play the run, then step through it: every move below comes from the selected method's policy.")
     method_kpis()
     st.markdown(f"<div class='method' style='--accent:{color}'>{METHOD_EXPLAIN[method]}</div>", unsafe_allow_html=True)
 
-    ep = get_episode(res, cfg, method, start_pose(start_name, seed, cfg), seed, horizon, custom_thr)
+    ep = get_episode(res, cfg, method, room_key, start_pose(start_name, seed, cfg, room), seed, horizon, custom_thr)
     n = len(ep["action"])
-    frame_ms = {"0.5×": 660, "1×": 330, "2×": 165, "4×": 80, "8×": 40}[speed]
+    stride = 1 if n <= 300 else 2 if n <= 600 else 3
     left, right = st.columns([1.7, 1], gap="medium")
     with left:
         with st.container(border=True):
-            chart(plots.arena_animation(ep, cfg.twin.robot_radius, color, LABELS[method], frame_ms, 1 if n <= 450 else 2, 540))
+            chart(arena.mission_animation(ep, room, cfg.twin.robot_radius, color, SPEED_MS[speed] * stride, stride, 600))
             legend = " ".join(f"<span class='pill' style='background:{ZONE_COLOR[i]}'>{ZONES[i]}</span>" for i in (0, 3, 4))
             note(f"▶ Play / ⏸ Pause animate the run; drag the slider to scrub. Red rays: front arc · teal rays: left arc. "
                  f"Path dots by zone: {legend}")
     with right:
         with st.container(border=True):
             st.markdown("**Decision inspector**")
-            key = f"step_{method}_{start_name}_{seed}_{horizon}"
+            key = f"step_{method}_{room_key}_{start_name}_{seed}_{horizon}"
             if key not in st.session_state:
                 st.session_state[key] = 0
 
@@ -367,7 +401,7 @@ def page_robot():
     kpis([("Cumulative reward", f"{ep['reward'].sum():.1f}", "this run", color),
           ("Steps", f"{n}", f"{n / 3:.0f} s of driving", color),
           ("Final state", state_label(int(ep["next_state"][-1]), stc), None, color),
-          ("Outcome", "Collision" if ep["crashed"][-1] else "No collision", None, color)])
+          ("Outcome", OUTCOME_LABEL[ep["outcome"]], None, color)])
 
     t1, t2, t3 = st.tabs(["Sensors & reward over time", "Decision log", f"Batch run ({n_batch} episodes)"])
     with t1:
@@ -385,6 +419,20 @@ def page_robot():
         table(logdf, 360)
         st.download_button("Download decision log (CSV)", logdf.to_csv(index=False), f"decision_log_{method}.csv", "text/csv")
     with t3:
+        if room.has_mission:
+            ms, times = mission_stats(res, cfg, method, n_batch, seed * 97 + 5, custom_thr)
+            kpis([("Reached the exit", f"{ms['exit_rate']:.0%}", f"{n_batch} runs from the entry", color),
+                  ("Loops stopped", f"{ms['loop_rate']:.0%}", "watchdog", color),
+                  ("Collisions", f"{ms['crash_rate']:.0%}", None, color),
+                  ("Median time to exit", "—" if np.isnan(ms['median_time_s']) else f"{ms['median_time_s']:.0f} s",
+                   None, color)])
+            if len(times):
+                hf = go.Figure(go.Histogram(x=times, marker_color=color, nbinsx=25))
+                plots._layout(hf, f"Time from entry to exit ({len(times)} successful runs)", 280)
+                hf.update_xaxes(title="seconds")
+                hf.update_yaxes(title="runs")
+                chart(hf)
+            return
         bs, br, _ = batch_run(res, cfg, method, n_batch, horizon, seed * 97 + 5, custom_thr)
         kpis([("Mean discounted return", f"{bs['return_mean']:.2f}", f"± {bs['return_ci95']:.2f} (95% CI)", color),
               ("Success rate", f"{1 - bs['crash_rate']:.0%}", None, color),
@@ -411,7 +459,8 @@ def page_compare():
           ("Fastest training", f"{min(res['runtime'][k]['seconds'] for k in learned):.1f} s", None, "#0F8B8D"),
           ("VI sweeps / ADP fits", f"{res['vi'].iterations} / {res['adp'].iterations}", None, "#0F8B8D")])
 
-    t1, t2, t3, t4 = st.tabs(["Scoreboard", "Performance charts", "Behaviour & policies", "Model check"])
+    t1, t2, t3, t5, t4 = st.tabs(["Scoreboard", "Performance charts", "Behaviour & policies", "Mission hall",
+                                  "Model check"])
     with t1:
         conv = {"mdp": ("Yes" if res["vi"].converged else "No") + f" (‖ΔV‖∞ < {cfg.solver.tol:g})",
                 "adp": ("Yes" if res["adp"].converged else "No") + f" (max|ΔQ̂| < {cfg.solver.adp_tol:g})",
@@ -492,9 +541,24 @@ def page_compare():
                 "mcps": threshold_actions(F_, L_, res["mc"].best_theta), "hj": threshold_actions(F_, L_, res["hj"].best_theta)}
         chart(plots.policy_maps(maps, stc))
         note("Threshold policies are shown at each cell's midpoint; ADP shows the majority action per cell.")
-        st.markdown(f"##### Same start, six controllers · {start_name}")
-        eps = {k: get_episode(res, cfg, k, start_pose(start_name, seed, cfg), seed, horizon) for k in METHOD_KEYS}
-        chart(plots.arena_paths(eps, 240))
+        st.markdown(f"##### Same start, six controllers · {ROOMS[room_key].name} · {start_name}")
+        start = start_pose(start_name, seed, cfg, room)
+        eps = {k: get_episode(res, cfg, k, room_key, start, seed, horizon) for k in METHOD_KEYS}
+        chart(arena.paths_grid(eps, room, COLORS, LABELS))
+    with t5:
+        n_m = 100
+        with st.spinner("Running the mission-hall test (≈15 s the first time)…"):
+            stats = {k: mission_stats(res, cfg, k, n_m, ev.seed + 900)[0] for k in METHOD_KEYS}
+        note(f"{n_m} runs per method from the entry door of the mission hall ({MISSION_HORIZON / 3:.0f} s limit), on "
+             "fresh seeds. The policies were trained in the calibration room, so this is a test of how well each one "
+             "carries over to a room it has never seen.")
+        chart(arena.outcome_bars(stats, LABELS))
+        table(pd.DataFrame([{
+            "Algorithm": LABELS[k], "Reached exit": f"{stats[k]['exit_rate']:.0%}",
+            "Loops stopped": f"{stats[k]['loop_rate']:.0%}", "Collisions": f"{stats[k]['crash_rate']:.0%}",
+            "Median time to exit": "—" if np.isnan(stats[k]["median_time_s"]) else f"{stats[k]['median_time_s']:.0f} s",
+            "Median path length": "—" if np.isnan(stats[k]["median_distance_m"]) else f"{stats[k]['median_distance_m']:.1f} m"}
+            for k in METHOD_KEYS]))
     with t4:
         mg = res["model_gap"]
         kpis([("MDP: model prediction", f"{mg['mdp']['predicted']:.2f}", "E[V*(s₀)]", METHOD_COLOR["mdp"]),
@@ -796,10 +860,11 @@ def page_about():
     with t1:
         st.markdown(f"""
 1. **Data** → controller rule, state bins, reward zones, speed, sensor cap and spike rate (`rdmu/data.py`).
-2. **Digital twin** → unicycle robot, 24 simulated sonar beams, polygonal room (`rdmu/twin.py`), checked against the recording.
+2. **Digital twin** → unicycle robot, 24 simulated sonar beams, polygonal rooms with pillars (`rdmu/twin.py`, `rdmu/rooms.py`), checked against the recording.
 3. **Model** → P(s′|s,a) and R(s,a) from all four actions simulated at {res['model'].n_samples // 4:,} poses (`rdmu/model.py`).
 4. **Methods** → value iteration (`mdp.py`), fitted Q-iteration (`adp.py`), Monte Carlo and Hooke–Jeeves (`policy_search.py`).
-5. **Evaluation** → same starts and noise for every controller, on seeds never used in training (`evaluation.py`).""")
+5. **Evaluation** → same starts and noise for every controller, on seeds never used in training (`evaluation.py`).
+6. **Missions** → entry-to-exit runs in the mission hall with a loop watchdog (`mission.py`), drawn by `arena.py`.""")
     with t2:
         table(pd.DataFrame([
             ("Decision interval", "1/3 s (3 samples)", "Assumption; 9 Hz sampling from data"),
@@ -807,7 +872,9 @@ def page_about():
             ("Turn rates (slight / sharp)", f"{abs(cfg.twin.turn_rate[1])} / {abs(cfg.twin.turn_rate[2])} rad/s", "Calibrated to recorded medians"),
             ("Robot radius", f"{cfg.twin.robot_radius} m", "SCITOS-G5 footprint"),
             ("Sensor noise / spike rate", f"0.5 cm + 1% / {cfg.twin.spike_prob:.1%}", "Assumption / data"),
-            ("Room", "6.4 × 4.2 m, pillar and recess", "Assumption; real plan not published"),
+            ("Training room", "6.4 × 4.2 m, pillar and recess", "Assumption; real plan not published"),
+            ("Mission hall", "8.4 × 5.6 m, 3 pillars, entry and exit", "Showcase and transfer test"),
+            ("Loop watchdog", "back within 0.30 m of a spot passed ≥ 20 s earlier", "Assumption; stops laps and orbits"),
             ("Reward values", "+1 / −0.5 / −2 / −25", "Assumption; zone thresholds from data"),
             ("γ, tolerance", f"{cfg.solver.gamma}, {cfg.solver.tol:g}", "Slide inputs, adjustable"),
         ], columns=["Item", "Value", "Basis"]))

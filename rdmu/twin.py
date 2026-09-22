@@ -23,19 +23,15 @@ import numpy as np
 
 from .config import TwinConfig
 
-# Room outline, counter-clockwise, metres.  [assumption] The real room's plan is
-# not published.  We use a 6.4 x 4.2 m room with one wall-mounted pillar (bottom)
-# and one recess (top).  Features sit >= 1.8 m from the corners so the robot can
-# complete each manoeuvre; the pillar and recess create the convex corners that
-# require left turns, the four room corners require sharp right turns.
-SCITOS_ROOM = np.array([
-    (0.0, 0.0), (2.6, 0.0), (2.6, 0.7), (3.8, 0.7), (3.8, 0.0), (6.4, 0.0),
-    (6.4, 4.2), (4.6, 4.2), (4.6, 3.6), (3.4, 3.6), (3.4, 4.2), (0.0, 4.2),
-])
+from .rooms import CALIBRATION, Room
+
+# Room outline of the calibration room (kept for backwards compatibility).  All
+# room layouts, including the mission hall with pillars, live in rdmu.rooms.
+SCITOS_ROOM = CALIBRATION.outer
 ROOM_BOUNDS = (6.4, 4.2)
 
-SEG_A = SCITOS_ROOM
-SEG_B = np.roll(SCITOS_ROOM, -1, axis=0)
+SEG_A = CALIBRATION.seg_a
+SEG_B = CALIBRATION.seg_b
 
 N_BEAMS = 24
 BEAM_ANGLES = np.deg2rad(np.arange(N_BEAMS) * 15.0)   # 0 = front, +90 = left (CCW)
@@ -57,14 +53,15 @@ def _cross(a, b):
     return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
 
-def raycast(origins: np.ndarray, angles: np.ndarray, max_range: float = 5.0) -> np.ndarray:
-    """Distance from each origin along each angle to the first wall.
+def raycast(origins: np.ndarray, angles: np.ndarray, max_range: float = 5.0,
+            seg_a: np.ndarray = SEG_A, seg_b: np.ndarray = SEG_B) -> np.ndarray:
+    """Distance from each origin along each angle to the first wall or pillar.
 
     origins: (N, 2); angles: (N, B) absolute angles.  Returns (N, B)."""
     d = np.stack([np.cos(angles), np.sin(angles)], axis=-1)[:, :, None, :]   # N,B,1,2
     o = origins[:, None, None, :]                                               # N,1,1,2
-    a = SEG_A[None, None, :, :]
-    s = (SEG_B - SEG_A)[None, None, :, :]
+    a = seg_a[None, None, :, :]
+    s = (seg_b - seg_a)[None, None, :, :]
     denom = _cross(d, s)                                                        # N,B,W
     ao = a - o
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -75,21 +72,21 @@ def raycast(origins: np.ndarray, angles: np.ndarray, max_range: float = 5.0) -> 
     return np.minimum(t.min(axis=-1), max_range + 10.0)
 
 
-def wall_clearance(points: np.ndarray) -> np.ndarray:
-    """Euclidean distance from each point (N, 2) to the nearest wall."""
+def wall_clearance(points: np.ndarray, seg_a: np.ndarray = SEG_A, seg_b: np.ndarray = SEG_B) -> np.ndarray:
+    """Euclidean distance from each point (N, 2) to the nearest wall or pillar."""
     p = points[:, None, :]
-    a = SEG_A[None]
-    ab = (SEG_B - SEG_A)[None]
+    a = seg_a[None]
+    ab = (seg_b - seg_a)[None]
     t = np.clip(((p - a) * ab).sum(-1) / (ab * ab).sum(-1), 0.0, 1.0)
     proj = a + t[..., None] * ab
     return np.linalg.norm(p - proj, axis=-1).min(axis=1)
 
 
-def inside_room(points: np.ndarray) -> np.ndarray:
-    """Even-odd point-in-polygon test."""
+def inside_room(points: np.ndarray, seg_a: np.ndarray = SEG_A, seg_b: np.ndarray = SEG_B) -> np.ndarray:
+    """Even-odd point-in-polygon test (points inside a pillar count as outside)."""
     x, y = points[:, 0:1], points[:, 1:2]
-    x1, y1 = SEG_A[:, 0][None], SEG_A[:, 1][None]
-    x2, y2 = SEG_B[:, 0][None], SEG_B[:, 1][None]
+    x1, y1 = seg_a[:, 0][None], seg_a[:, 1][None]
+    x2, y2 = seg_b[:, 0][None], seg_b[:, 1][None]
     cond = (y1 > y) != (y2 > y)
     with np.errstate(divide="ignore", invalid="ignore"):
         xint = (x2 - x1) * (y - y1) / (y2 - y1) + x1
@@ -99,9 +96,17 @@ def inside_room(points: np.ndarray) -> np.ndarray:
 class WallFollowTwin:
     """Vectorised simulator.  A pose is (x, y, heading)."""
 
-    def __init__(self, cfg: TwinConfig = TwinConfig()):
+    def __init__(self, cfg: TwinConfig = TwinConfig(), room: Room = CALIBRATION):
         self.cfg = cfg
+        self.room = room
+        self.seg_a, self.seg_b = room.seg_a, room.seg_b
         self.arcs = arc_beams(cfg.arc_deg)
+
+    def _clear(self, xy):
+        return wall_clearance(xy, self.seg_a, self.seg_b)
+
+    def _inside(self, xy):
+        return inside_room(xy, self.seg_a, self.seg_b)
 
     # ------------------------------------------------------------------ sensing
     def beam_ranges(self, poses: np.ndarray) -> np.ndarray:
@@ -109,7 +114,8 @@ class WallFollowTwin:
         ang = poses[:, 2:3] + BEAM_ANGLES[None, :]
         out = np.empty((len(poses), N_BEAMS))
         for i in range(0, len(poses), 4000):
-            out[i:i + 4000] = raycast(poses[i:i + 4000, :2], ang[i:i + 4000], self.cfg.max_range)
+            out[i:i + 4000] = raycast(poses[i:i + 4000, :2], ang[i:i + 4000], self.cfg.max_range,
+                                        self.seg_a, self.seg_b)
         return np.clip(out - self.cfg.robot_radius, 0.0, self.cfg.max_range)
 
     def sense(self, poses: np.ndarray, rng: np.random.Generator, return_beams: bool = False):
@@ -142,7 +148,7 @@ class WallFollowTwin:
             cand[:, 0] += v * h * np.cos(mid)
             cand[:, 1] += v * h * np.sin(mid)
             cand[:, 2] += w * h
-            hit = (wall_clearance(cand[:, :2]) < c.robot_radius + c.collision_margin) | ~inside_room(cand[:, :2])
+            hit = (self._clear(cand[:, :2]) < c.robot_radius + c.collision_margin) | ~self._inside(cand[:, :2])
             hit &= ~crashed
             crashed |= hit
             new = np.where(crashed[:, None], new, cand)
@@ -156,18 +162,19 @@ class WallFollowTwin:
     def track_starts(self, n: int, rng: np.random.Generator) -> np.ndarray:
         """Poses on the wall-following track: 0.5-0.8 m from a wall, wall on the
         left (clockwise traversal, as in the recording), heading +-20 deg."""
-        lengths = np.linalg.norm(SEG_B - SEG_A, axis=1)
+        A, B = self.seg_a, self.seg_b
+        lengths = np.linalg.norm(B - A, axis=1)
         out = []
         while len(out) < n:
-            k = rng.choice(len(SEG_A), size=4 * n, p=lengths / lengths.sum())
+            k = rng.choice(len(A), size=4 * n, p=lengths / lengths.sum())
             u = rng.uniform(0.2, 0.8, size=4 * n)
-            e = SEG_B[k] - SEG_A[k]
+            e = B[k] - A[k]
             e = e / np.linalg.norm(e, axis=1, keepdims=True)
             inward = np.stack([-e[:, 1], e[:, 0]], axis=1)       # CCW polygon: interior on the left
             off = self.cfg.robot_radius + rng.uniform(0.5, 0.8, size=4 * n)
-            p = SEG_A[k] + u[:, None] * (SEG_B[k] - SEG_A[k]) + inward * off[:, None]
+            p = A[k] + u[:, None] * (B[k] - A[k]) + inward * off[:, None]
             head = np.arctan2(-e[:, 1], -e[:, 0]) + np.deg2rad(rng.uniform(-20, 20, size=4 * n))
-            ok = inside_room(p) & (wall_clearance(p) > self.cfg.robot_radius + 0.25)
+            ok = self._inside(p) & (self._clear(p) > self.cfg.robot_radius + 0.25)
             out.extend(np.column_stack([p, head])[ok].tolist())
         return np.array(out[:n])
 
@@ -175,8 +182,9 @@ class WallFollowTwin:
         """Poses uniformly in free space with a uniform heading."""
         out = []
         while len(out) < n:
-            p = rng.uniform([0, 0], list(ROOM_BOUNDS), size=(4 * n, 2))
-            ok = inside_room(p) & (wall_clearance(p) > self.cfg.robot_radius + clearance)
+            x0, y0, x1, y1 = self.room.bounds
+            p = rng.uniform([x0, y0], [x1, y1], size=(4 * n, 2))
+            ok = self._inside(p) & (self._clear(p) > self.cfg.robot_radius + clearance)
             h = rng.uniform(-np.pi, np.pi, size=4 * n)
             out.extend(np.column_stack([p, h])[ok].tolist())
         return np.array(out[:n])
