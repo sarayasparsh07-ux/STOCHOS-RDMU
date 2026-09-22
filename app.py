@@ -338,7 +338,11 @@ def race_view():
              "⟲ loop detected and stopped · ✕ collision · ⏱ out of time.")
     kpis([(LABELS[k], OUTCOME_LABEL[eps[k]["outcome"]],
            f"{len(eps[k]['action']) / 3:.0f} s · Σ reward {eps[k]['reward'].sum():+.1f}", COLORS[k]) for k in METHOD_KEYS])
-    chart(arena.robot_closeup({k: COLORS[k] for k in METHOD_KEYS}, {k: arena.SHORT[k] for k in METHOD_KEYS}, height=150))
+    chart(arena.robot_closeup({k: COLORS[k] for k in METHOD_KEYS}, {k: arena.SHORT[k] for k in METHOD_KEYS}, height=170))
+    note("Each controller drives an autonomous robot car of the same design — chassis, canopy, sensor pod, "
+         "headlights and four wheels — in its own colour, so the fleet reads as one system. The <b>Random</b> car is "
+         "drawn with a dashed canopy and a cloud of sample points to mark it as the probabilistic agent that picks its "
+         "action at random. The drawings are top-down views of the twin's robot; they do not change the model.")
 
 
 def page_robot():
@@ -355,7 +359,7 @@ def page_robot():
     left, right = st.columns([1.7, 1], gap="medium")
     with left:
         with st.container(border=True):
-            chart(arena.mission_animation(ep, room, cfg.twin.robot_radius, color, SPEED_MS[speed] * stride, stride, 600))
+            chart(arena.mission_animation(ep, room, cfg.twin.robot_radius, color, SPEED_MS[speed] * stride, stride, 600, kind="random" if method == "random" else "car"))
             legend = " ".join(f"<span class='pill' style='background:{ZONE_COLOR[i]}'>{ZONES[i]}</span>" for i in (0, 3, 4))
             note(f"▶ Play / ⏸ Pause animate the run; drag the slider to scrub. Red rays: front arc · teal rays: left arc. "
                  f"Path dots by zone: {legend}")
